@@ -1,6 +1,7 @@
 import 'dotenv/config';
 import Fastify from 'fastify';
 import { healthRoutes } from './routes/health.js';
+import { prisma } from './db/prisma.js';
 
 const PORT = Number(process.env.PORT ?? 3000);
 const HOST = process.env.HOST ?? '0.0.0.0';
@@ -10,6 +11,10 @@ const app = Fastify({
 });
 
 await app.register(healthRoutes);
+
+app.addHook('onClose', async () => {
+  await prisma.$disconnect();
+});
 
 async function start(): Promise<void> {
   try {
