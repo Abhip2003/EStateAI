@@ -7,6 +7,9 @@ export default defineConfig({
   schema: "prisma/schema.prisma",
   migrations: {
     path: "prisma/migrations",
+    // Runs the compiled output, not tsx-on-the-fly — see src/scripts/seed.ts's
+    // own comment for why (the production image ships dist/ only).
+    seed: "node dist/scripts/seed.js",
   },
   datasource: {
     url: process.env["DATABASE_URL"],

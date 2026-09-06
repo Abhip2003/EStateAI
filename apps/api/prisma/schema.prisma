@@ -18,18 +18,19 @@ enum UserRole {
 }
 
 model User {
-  id            String    @id @default(cuid())
-  email         String    @unique
+  id            String   @id @default(cuid())
+  email         String   @unique
   passwordHash  String
   firstName     String
   lastName      String
   avatarUrl     String?
-  emailVerified Boolean   @default(false)
-  role          UserRole  @default(USER)
-  createdAt     DateTime  @default(now())
-  updatedAt     DateTime  @updatedAt
+  emailVerified Boolean  @default(false)
+  role          UserRole @default(USER)
+  createdAt     DateTime @default(now())
+  updatedAt     DateTime @updatedAt
 
   refreshTokens RefreshToken[]
+  assets        Asset[]
 }
 
 model RefreshToken {
@@ -43,4 +44,636 @@ model RefreshToken {
   user User @relation(fields: [userId], references: [id], onDelete: Cascade)
 
   @@index([userId])
+}
+
+enum AssetStatus {
+  ACTIVE
+  WARNING
+  INACTIVE
+  ARCHIVED
+}
+
+enum Visibility {
+  PRIVATE
+  SHARED
+  PUBLIC
+}
+
+enum Severity {
+  INFO
+  WARNING
+  ERROR
+  CRITICAL
+}
+
+// Reference/taxonomy table (e.g. Website, GitHub, Domain, AWS). Not
+// user-owned — assets are restricted from deletion here, not cascaded, so a
+// category can't be removed out from under assets that still reference it.
+model AssetCategory {
+  id          String   @id @default(cuid())
+  name        String   @unique
+  slug        String   @unique
+  description String?
+  icon        String?
+  createdAt   DateTime @default(now())
+  updatedAt   DateTime @updatedAt
+
+  assets Asset[]
+}
+
+model Asset {
+  id          String      @id @default(cuid())
+  userId      String
+  categoryId  String
+  name        String
+  displayName String?
+  description String?
+  // 0-100, enforced by the service/validation layer (see AssetService) —
+  // not a DB CHECK constraint, so it stays consistent with how enums below
+  // are also application-validated via Zod before ever reaching Prisma.
+  riskScore   Int         @default(0)
+  status      AssetStatus @default(ACTIVE)
+  visibility  Visibility  @default(PRIVATE)
+  createdAt   DateTime    @default(now())
+  updatedAt   DateTime    @updatedAt
+
+  user      User          @relation(fields: [userId], references: [id], onDelete: Cascade)
+  category  AssetCategory @relation(fields: [categoryId], references: [id], onDelete: Restrict)
+  accounts  Account[]
+  assetTags AssetTag[]
+  events    AssetEvent[]
+
+  @@index([userId])
+  @@index([categoryId])
+  @@index([status])
+}
+
+// One connected external account under an asset (e.g. a specific GitHub
+// login backing a "GitHub" asset). `provider` is a free-form string rather
+// than an enum so new integrations don't require a schema migration.
+model Account {
+  id               String    @id @default(cuid())
+  assetId          String
+  provider         String
+  externalId       String
+  displayName      String?
+  email            String?
+  username         String?
+  connectedAt      DateTime  @default(now())
+  lastSyncedAt     DateTime?
+  // Free-form status string (e.g. "connected", "disconnected", "error"),
+  // not an enum, for the same extensibility reason as `provider`.
+  connectionStatus String    @default("connected")
+  metadata         Json?
+
+  // AES-256-GCM encrypted credential (API key/token), base64-encoded IV +
+  // ciphertext + auth tag. Reversible on purpose — unlike passwordHash,
+  // this needs to be decrypted later to actually call the provider's API.
+  // Null for accounts connected without a stored secret.
+  credentialCiphertext String?
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@unique([provider, externalId])
+  @@index([assetId])
+}
+
+model Tag {
+  id    String  @id @default(cuid())
+  name  String  @unique
+  color String?
+
+  assetTags AssetTag[]
+}
+
+// Many-to-many join table between Asset and Tag. Composite primary key —
+// this table has no identity of its own beyond the pairing.
+model AssetTag {
+  assetId   String
+  tagId     String
+  createdAt DateTime @default(now())
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+  tag   Tag   @relation(fields: [tagId], references: [id], onDelete: Cascade)
+
+  @@id([assetId, tagId])
+}
+
+// Append-only timeline of what happened to an asset (connected, sync
+// completed, billing changed, security alert, ...). `type` is a free-form
+// string for the same reason as Account.provider.
+model AssetEvent {
+  id          String   @id @default(cuid())
+  assetId     String
+  type        String
+  severity    Severity @default(INFO)
+  title       String
+  description String?
+  metadata    Json?
+  createdAt   DateTime @default(now())
+
+  asset Asset @relation(fields: [assetId], references: [id], onDelete: Cascade)
+
+  @@index([assetId])
+  @@index([assetId, createdAt])
+}
+
+enum JobStatus {
+  QUEUED
+  RUNNING
+  COMPLETED
+  FAILED
+  RETRYING
+  CANCELLED
+  DEAD
+}
+
+// Declared ascending so `ORDER BY priority DESC` sorts CRITICAL first —
+// Postgres enums compare by declaration order, not alphabetically.
+enum JobPriority {
+  LOW
+  NORMAL
+  HIGH
+  CRITICAL
+}
+
+// Generic async job envelope for every long-running operation (sync,
+// discovery, future AI, ...). `type` is a free-form string like
+// Account.provider — new job types never require a migration. No
+// relation to Asset/Account: accountId/assetId are soft references (not
+// every job type has one, e.g. future AI/webhook jobs), so a deleted
+// asset/account never blocks deleting or orphans a job row.
+model SyncJob {
+  id          String      @id @default(cuid())
+  type        String
+  provider    String?
+  accountId   String?
+  assetId     String?
+  status      JobStatus   @default(QUEUED)
+  priority    JobPriority @default(NORMAL)
+  payload     Json?
+  result      Json?
+  error       String?
+  attempts    Int         @default(0)
+  maxAttempts Int         @default(5)
+  workerId    String?
+  createdAt   DateTime    @default(now())
+  startedAt   DateTime?
+  finishedAt  DateTime?
+  nextRetryAt DateTime?
+  heartbeatAt DateTime?
+
+  @@index([status])
+  @@index([priority])
+  @@index([nextRetryAt])
+  @@index([workerId])
+  // The actual hot-path query (claim the next eligible job).
+  @@index([status, priority, createdAt])
+}
+
+// A discovered resource's permanent identity is (provider,
+// providerResourceId) — global, not scoped to accountId/assetId. If two
+// different accounts ever discover the same external resource (e.g. a
+// shared GitHub org repo visible to two connected accounts), rediscovery
+// upserts the same row and accountId/assetId shift to whoever discovered
+// it most recently, rather than creating a duplicate. No relation to
+// Asset/Account, same reasoning as SyncJob: a deleted asset/account never
+// blocks deleting or orphans a resource row.
+model Resource {
+  id                 String    @id @default(cuid())
+  provider           String
+  providerResourceId String
+  accountId          String
+  assetId            String
+  resourceType       String
+  displayName        String
+  description        String?
+  externalUrl        String?
+  metadata           Json?
+  // sha256 of the normalized content (displayName/description/externalUrl/
+  // metadata) — cheap change detection without deep-diffing on every
+  // rediscovery.
+  hash               String
+  firstSeen          DateTime  @default(now())
+  lastSeen           DateTime  @default(now())
+  deletedAt          DateTime?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@unique([provider, providerResourceId])
+  @@index([provider])
+  @@index([resourceType])
+  @@index([assetId])
+}
+
+// A directed edge between two Resources. `relationshipType` is a free-form
+// string like Account.provider/SyncJob.type — new relationship types never
+// require a migration, only a new extractor registration (see
+// services/graph/relationship-extractors.ts). No relation to Resource,
+// same soft-reference reasoning as everywhere else in this schema. The
+// unique constraint is additive (not explicitly requested) — without it,
+// every rediscovery would duplicate the same edge.
+model Relationship {
+  id               String   @id @default(cuid())
+  fromResourceId   String
+  toResourceId     String
+  relationshipType String
+  provider         String
+  metadata         Json?
+  createdAt        DateTime @default(now())
+
+  @@unique([fromResourceId, toResourceId, relationshipType])
+  @@index([fromResourceId])
+  @@index([toResourceId])
+  @@index([relationshipType])
+}
+
+// Closed, stable severity scale shared by Finding and Recommendation
+// (Recommendation.priority reuses this enum rather than a near-duplicate
+// one, since a recommendation's priority is always derived 1:1 from its
+// finding's severity).
+enum FindingSeverity {
+  CRITICAL
+  HIGH
+  MEDIUM
+  LOW
+  INFORMATIONAL
+}
+
+enum FindingStatus {
+  OPEN
+  RESOLVED
+}
+
+enum RecommendationStatus {
+  OPEN
+  RESOLVED
+  DISMISSED
+}
+
+// Which entity an aggregated RiskScore row describes. Only the field
+// matching the scope is populated (e.g. scope=ACCOUNT only sets
+// accountId) — see RiskScore's own comment for why this isn't enforced as
+// a DB constraint.
+enum RiskScope {
+  RESOURCE
+  ACCOUNT
+  ASSET
+  OVERALL
+}
+
+// One row per (resourceId, ruleCode) — the unique constraint is what makes
+// re-evaluation idempotent: rerunning a rule against an unchanged resource
+// updates the same row instead of creating a duplicate. No relation to
+// Resource, same soft-reference reasoning as Resource/Relationship.
+model Finding {
+  id          String          @id @default(cuid())
+  resourceId  String
+  provider    String
+  ruleCode    String
+  severity    FindingSeverity
+  status      FindingStatus   @default(OPEN)
+  title       String
+  description String
+  // Always 100 for deterministic rules today (no LLM-derived uncertainty
+  // yet) — kept as a field now so a future probabilistic rule/AI finding
+  // doesn't require a schema change.
+  confidence  Int             @default(100)
+  metadata    Json?
+  resolvedAt  DateTime?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@unique([resourceId, ruleCode])
+  @@index([resourceId])
+  @@index([status])
+  @@index([severity])
+  @@index([provider])
+}
+
+// Exactly one Recommendation per Finding (enforced via @unique on
+// findingId) — "every Finding generates one Recommendation" per the Phase
+// 6A spec. No relation to Finding, same soft-reference reasoning as
+// elsewhere in this schema.
+model Recommendation {
+  id              String                @id @default(cuid())
+  findingId       String                @unique
+  priority        FindingSeverity
+  title           String
+  description     String
+  estimatedImpact String?
+  status          RecommendationStatus  @default(OPEN)
+  metadata        Json?
+  createdAt       DateTime              @default(now())
+  updatedAt       DateTime              @updatedAt
+
+  @@index([status])
+  @@index([priority])
+}
+
+// An aggregated risk snapshot at one of four scopes (see RiskScope). Only
+// one of assetId/accountId/resourceId is set per row, matching the scope;
+// OVERALL rows have none set. There is deliberately no DB unique
+// constraint enforcing "one row per scope+entity" — Postgres unique
+// constraints treat NULLs as distinct from each other, which would let
+// duplicate OVERALL/ACCOUNT/ASSET rows slip through since most of the
+// columns are null for any given scope. RiskService is the sole writer and
+// enforces one-row-per-scope+entity at the application layer instead (find
+// existing row, update in place, else create).
+model RiskScore {
+  id                 String    @id @default(cuid())
+  scope              RiskScope
+  assetId            String?
+  accountId          String?
+  provider           String?
+  resourceId         String?
+  overallScore       Int
+  criticalCount      Int       @default(0)
+  highCount          Int       @default(0)
+  mediumCount        Int       @default(0)
+  lowCount           Int       @default(0)
+  informationalCount Int       @default(0)
+  metadata           Json?
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+
+  @@index([scope])
+  @@index([assetId])
+  @@index([accountId])
+  @@index([resourceId])
+}
+
+// The result a Policy evaluation can settle on. FAIL is a real violation;
+// WARNING is a permitted-but-flagged state (e.g. an archived repository is
+// allowed but still worth surfacing); NOT_APPLICABLE means the policy has
+// nothing to say about this resource (wrong shape, or explicitly excluded
+// — e.g. a forked repository).
+enum PolicyResultStatus {
+  PASS
+  FAIL
+  WARNING
+  NOT_APPLICABLE
+}
+
+// The persisted, configurable record of a code-registered Policy (see
+// policy-registry.ts). `code` is what the registry keys policies by;
+// name/description/provider/resourceType/severity/conditions are synced
+// from the registered Policy's metadata on every evaluation run
+// (PolicyService.ensureRegisteredPoliciesPersisted), but `enabled` is
+// deliberately never overwritten by that sync — it's the one field an
+// operator can change (via PolicyRepository.update) that evaluation
+// actually respects, same spirit as SyncJob.status being the one thing a
+// worker claim can change without touching the rest of the row.
+model Policy {
+  id           String          @id @default(cuid())
+  code         String          @unique
+  name         String
+  description  String
+  enabled      Boolean         @default(true)
+  provider     String
+  resourceType String
+  severity     FindingSeverity
+  conditions   Json?
+  createdAt    DateTime        @default(now())
+  updatedAt    DateTime        @updatedAt
+
+  @@index([provider])
+  @@index([enabled])
+}
+
+// One row per (policyId, resourceId) — the latest evaluation, not a
+// history log. Re-evaluation upserts in place, same idempotency shape as
+// Finding's (resourceId, ruleCode) uniqueness. `findingId` is set when a
+// FAIL/WARNING was driven by a specific Finding (soft ref, no FK, same
+// reasoning as everywhere else in this schema); null for policies that
+// pass vacuously or inspect the resource directly (e.g. fork exclusion).
+model PolicyResult {
+  id          String             @id @default(cuid())
+  policyId    String
+  resourceId  String
+  findingId   String?
+  status      PolicyResultStatus
+  reason      String
+  metadata    Json?
+  evaluatedAt DateTime           @default(now())
+  createdAt   DateTime           @default(now())
+  updatedAt   DateTime           @updatedAt
+
+  @@unique([policyId, resourceId])
+  @@index([resourceId])
+  @@index([policyId])
+  @@index([status])
+}
+
+enum AgentPlanStatus {
+  RUNNING
+  COMPLETED
+  FAILED
+}
+
+// One audit row per AgentOrchestrator.execute() call — not a queue (unlike
+// SyncJob), not a snapshot table (unlike RiskScore). Written once at start
+// (status=RUNNING) and once at completion (COMPLETED/FAILED + summary),
+// purely so GET /agents/plans/:id has something to read; the orchestrator
+// itself always runs synchronously in-request and never reads this row
+// back mid-run. `summary` stores the same shape ResultAggregatorService
+// returns to the caller (per-task status/timing + merged agent data).
+model AgentPlanExecution {
+  id          String          @id @default(cuid())
+  requestType String
+  assetId     String
+  status      AgentPlanStatus
+  summary     Json?
+  error       String?
+  startedAt   DateTime        @default(now())
+  completedAt DateTime?
+  durationMs  Int?
+  createdAt   DateTime        @default(now())
+  updatedAt   DateTime        @updatedAt
+
+  @@index([assetId])
+  @@index([requestType])
+  @@index([status])
+}
+
+enum AIRequestStatus {
+  SUCCESS
+  FAILED
+}
+
+// One audit row per AIService.generate() call — write-once, after the
+// call settles (never updated afterward, unlike AgentPlanExecution which
+// is written at both start and completion). `assetId` is optional because
+// POST /ai/generate is not asset-scoped like /agents/execute — an AI
+// request may be a standalone utility call with nothing to attribute it
+// to. No FK relations (soft reference, same rationale as every other
+// audit/history table in this schema).
+model AIRequestLog {
+  id               String          @id @default(cuid())
+  provider         String
+  model            String
+  assetId          String?
+  status           AIRequestStatus
+  promptTokens     Int
+  completionTokens Int
+  totalTokens      Int
+  estimatedCostUsd Float
+  latencyMs        Int
+  attempts         Int             @default(1)
+  error            String?
+  createdAt        DateTime        @default(now())
+
+  @@index([provider])
+  @@index([assetId])
+  @@index([status])
+}
+
+// A free-form document type an agent output was indexed as. Kept as a
+// plain string (not an enum) so a future agent can index a new kind of
+// document without a migration — same "free-form over enum" rationale
+// as Account.provider/JobType elsewhere in this schema.
+enum KnowledgeDocumentType {
+  FINDING
+  RECOMMENDATION
+  REPORT
+  COMPLIANCE_RESULT
+  RISK_ASSESSMENT
+  DISCOVERY_SUMMARY
+  // Phase 30 — an episodic-memory summary indexed for retrieval, reusing
+  // the existing KnowledgeStore/RetrievalService rather than a new store.
+  EPISODE
+}
+
+// One indexed, embeddable unit of agent output — the Knowledge Store's
+// storage unit (Phase 23). `embedding` is Postgres `vector(1536)` via
+// Prisma's `Unsupported(...)` type: Prisma has no native pgvector
+// support, so the column is created by raw SQL in the migration and
+// queried with `$queryRaw`/`$executeRaw` (see knowledge.repository.ts)
+// rather than the generated client. 1536 is fixed regardless of which
+// EmbeddingProvider produced the vector — EmbeddingService pads/truncates
+// so every provider (including the local deterministic fallback) writes
+// the same width; `embeddingVersion` records which provider/model+width
+// actually produced it, so a future provider swap can be detected and
+// backfilled instead of silently comparing incompatible vectors.
+// No FK relation to Asset — soft reference, same reasoning as
+// RiskScore/PolicyResult/AIRequestLog above.
+model KnowledgeDocument {
+  id               String                @id @default(cuid())
+  assetId          String
+  agent            String
+  documentType      KnowledgeDocumentType
+  text             String
+  metadata         Json                  @default("{}")
+  tags             String[]              @default([])
+  embeddingVersion String
+  embedding        Unsupported("vector(1536)")?
+  sourceId         String?
+  createdAt        DateTime              @default(now())
+  updatedAt        DateTime              @updatedAt
+
+  @@index([assetId])
+  @@index([documentType])
+  @@index([agent])
+  @@index([assetId, documentType])
+}
+
+// One row per Retrieval Service query — the "retrieval trace" the spec
+// asks for: which documents were returned, at what similarity score, how
+// long it took, and against which embedding version, so retrieval
+// quality/drift can be audited after the fact. Write-once, like
+// AIRequestLog.
+model RetrievalTrace {
+  id               String   @id @default(cuid())
+  conversationId   String?
+  assetId          String?
+  query            String
+  documentIds      String[]
+  scores           Float[]
+  latencyMs        Int
+  embeddingVersion String
+  createdAt        DateTime @default(now())
+
+  @@index([conversationId])
+  @@index([assetId])
+}
+
+// One audit row per ToolExecutor.run() call (Phase 24 — Tool-Using
+// Agents) — the "Tool Execution Trace" the spec asks for: which tool,
+// which agent called it, how long it took, the arguments given, and
+// whether it succeeded. Write-once, same shape/rationale as
+// RetrievalTrace/AIRequestLog above. `arguments` is the tool's already
+// zod-validated input, stored as-is; no FK/soft-reference to a specific
+// domain row since a tool call isn't scoped to one entity the way a
+// Finding/Recommendation is.
+model ToolExecutionTrace {
+  id          String   @id @default(cuid())
+  toolName    String
+  agentId     String?
+  arguments   Json
+  success     Boolean
+  error       String?
+  durationMs  Int
+  createdAt   DateTime @default(now())
+
+  @@index([toolName])
+  @@index([agentId])
+}
+
+// ---------------------------------------------------------------------------
+// Phase 31 — Python AI service trace tables.
+//
+// Owned exclusively by apps/ai-service (the FastAPI/LangGraph service).
+// Deliberately isolated from the TypeScript audit tables (AIRequestLog /
+// RetrievalTrace / ToolExecutionTrace): the Python service is granted
+// INSERT/UPDATE only on these two, and read-only access elsewhere, so a
+// bug in the Python layer can never corrupt the deterministic security
+// tables that remain the source of truth. No FK relations — soft
+// reference, same rationale as every other audit table in this schema.
+// ---------------------------------------------------------------------------
+
+enum AiPyRunStatus {
+  RUNNING
+  COMPLETED
+  PARTIAL
+  FAILED
+}
+
+// One row per agent run inside the Python service (six agents + graph
+// nodes). Written at start (RUNNING) and updated once on completion.
+model AiPyRun {
+  id              String        @id
+  correlationId   String
+  agent           String
+  userId          String
+  assetId         String?
+  accountId       String?
+  status          AiPyRunStatus @default(RUNNING)
+  confidenceScore Float         @default(0)
+  durationMs      Int           @default(0)
+  llmCalls        Int           @default(0)
+  inputSummary    Json?
+  error           String?
+  startedAt       DateTime      @default(now())
+  finishedAt      DateTime?
+
+  @@index([agent])
+  @@index([assetId])
+  @@index([correlationId])
+  @@index([status])
+}
+
+// One row per notable sub-step of an AiPyRun (LLM call, tool call, RAG
+// retrieval, graph node). Write-once.
+model AiPyTrace {
+  id         String   @id
+  runId      String
+  kind       String
+  name       String
+  ok         Boolean
+  durationMs Int      @default(0)
+  detail     Json?
+  createdAt  DateTime @default(now())
+
+  @@index([runId])
+  @@index([kind])
 }

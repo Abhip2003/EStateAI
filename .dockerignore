@@ -1,0 +1,22 @@
+# Build context is the repo root for both apps/api/Dockerfile and
+# apps/web/Dockerfile — this file applies to both.
+
+**/node_modules
+**/.pnpm-store
+**/dist
+**/.next
+**/coverage
+**/*.tsbuildinfo
+
+.git
+.github
+docs
+*.md
+
+**/.env
+**/.env.local
+**/.env.*.local
+!**/.env.example
+
+**/*.log
+.DS_Store

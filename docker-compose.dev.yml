@@ -1,0 +1,88 @@
+# Full development stack: Postgres + Redis + apps/api + apps/web, all
+# hot-reloading via source bind-mounts against each Dockerfile's `dev`
+# stage. This is a superset of docker-compose.yml (infra-only) — use this
+# file instead of that one when you want the app containers running under
+# Docker too, rather than `pnpm dev` on the host.
+#
+#   docker compose -f docker-compose.dev.yml up
+#
+# For most day-to-day work, running Postgres/Redis via docker-compose.yml
+# and the two apps via `pnpm dev` directly on the host (as documented in
+# docs/development.md) is faster to iterate with — this file exists for
+# testing the containerized dev experience itself, or for contributors who
+# don't want Node installed locally.
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: estateai
+      POSTGRES_PASSWORD: estateai
+      POSTGRES_DB: estateai
+    ports:
+      - '5432:5432'
+    volumes:
+      - postgres_dev_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U estateai -d estateai']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    ports:
+      - '6379:6379'
+    volumes:
+      - redis_dev_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: dev
+    restart: unless-stopped
+    env_file:
+      - apps/api/.env
+    environment:
+      DATABASE_URL: postgresql://estateai:estateai@postgres:5432/estateai?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+    ports:
+      - '3000:3000'
+    volumes:
+      - ./apps/api:/repo/apps/api
+      - /repo/apps/api/node_modules
+      - /repo/node_modules
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: dev
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_API_URL: http://localhost:3000
+    ports:
+      - '3001:3001'
+    volumes:
+      - ./apps/web:/repo/apps/web
+      - /repo/apps/web/node_modules
+      - /repo/node_modules
+    depends_on:
+      - api
+
+volumes:
+  postgres_dev_data:
+  redis_dev_data:

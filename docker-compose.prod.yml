@@ -1,0 +1,109 @@
+# Full production stack: Postgres + Redis + apps/api + apps/web, fronted by
+# nginx (TLS termination point, WebSocket upgrade, compression, security
+# headers — see nginx/nginx.conf). Secrets (JWT_SECRET,
+# CREDENTIAL_ENCRYPTION_KEY, AI provider keys, etc.) are supplied via
+# apps/api/.env, which is never baked into the image.
+#
+#   docker compose -f docker-compose.prod.yml up -d --build
+#
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-estateai}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD is required}
+      POSTGRES_DB: ${POSTGRES_DB:-estateai}
+    volumes:
+      - postgres_prod_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U ${POSTGRES_USER:-estateai} -d ${POSTGRES_DB:-estateai}']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  redis:
+    image: redis:7
+    restart: unless-stopped
+    volumes:
+      - redis_prod_data:/data
+    healthcheck:
+      test: ['CMD', 'redis-cli', 'ping']
+      interval: 5s
+      timeout: 5s
+      retries: 5
+    networks:
+      - internal
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+      target: runtime
+    restart: unless-stopped
+    env_file:
+      - apps/api/.env
+    environment:
+      NODE_ENV: production
+      DATABASE_URL: postgresql://${POSTGRES_USER:-estateai}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB:-estateai}?schema=public
+      REDIS_HOST: redis
+      REDIS_PORT: 6379
+      # nginx is the one reverse-proxy hop in front of `api` in this
+      # topology — 'true' trusts its immediate X-Forwarded-For/X-Request-Id,
+      # which is what makes rate-limiting and request-id propagation
+      # reflect the real client instead of nginx's own container IP.
+      TRUSTED_PROXIES: 'true'
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:3000/health']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - internal
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      target: runtime
+      args:
+        NEXT_PUBLIC_API_URL: ${NEXT_PUBLIC_API_URL:-https://api.example.com}
+    restart: unless-stopped
+    depends_on:
+      - api
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost:3001/']
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 15s
+    networks:
+      - internal
+
+  nginx:
+    image: nginx:1.27-alpine
+    restart: unless-stopped
+    volumes:
+      - ./nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+    ports:
+      - '80:80'
+    depends_on:
+      - api
+      - web
+    networks:
+      - internal
+
+volumes:
+  postgres_prod_data:
+  redis_prod_data:
+
+networks:
+  internal:

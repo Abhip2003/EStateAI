@@ -1,6 +1,6 @@
 services:
   postgres:
-    image: postgres:16
+    image: pgvector/pgvector:pg16
     restart: unless-stopped
     environment:
       POSTGRES_USER: estateai
@@ -26,6 +26,45 @@ services:
     healthcheck:
       test: ["CMD", "redis-cli", "ping"]
       interval: 5s
+      timeout: 5s
+      retries: 5
+
+  # Phase 31 — Python AI service (FastAPI + LangChain + LangGraph).
+  # Optional: only needed when apps/api runs with AI_SERVICE_MODE=python.
+  # Start it explicitly with:  docker compose up ai-service
+  # It expects the Prisma migration `add_ai_py_traces` to have been applied
+  # (apps/api: `pnpm prisma migrate deploy`) so the AiPyRun / AiPyTrace and
+  # graph-checkpoint tables exist.
+  ai-service:
+    build:
+      context: ./apps/ai-service
+      dockerfile: Dockerfile
+    restart: unless-stopped
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    environment:
+      ENVIRONMENT: development
+      PORT: "8000"
+      AI_SERVICE_TOKEN: ${AI_SERVICE_TOKEN:-dev-insecure-service-token-change-me}
+      FASTIFY_API_URL: ${FASTIFY_API_URL:-http://host.docker.internal:3000}
+      LLM_PROVIDER: ${LLM_PROVIDER:-anthropic}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      LLM_MODEL: ${LLM_MODEL:-claude-sonnet-5}
+      DATABASE_URL: postgresql://estateai:estateai@postgres:5432/estateai
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      REDIS_NAMESPACE: "ai:py:"
+      GRAPH_CHECKPOINT_BACKEND: postgres
+    ports:
+      - "8000:8000"
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+      interval: 15s
       timeout: 5s
       retries: 5
 

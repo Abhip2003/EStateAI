@@ -32,3 +32,13 @@ coverage/
 
 # Misc
 *.tsbuildinfo
+
+# Runtime / generated test artifacts
+apps/api/var/
+apps/web/playwright-report/
+apps/web/test-results/
+.venv/
+__pycache__/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/

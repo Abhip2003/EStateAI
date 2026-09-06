@@ -10,6 +10,7 @@ import {
   InvalidCredentialsError,
   InvalidRefreshTokenError,
 } from '../services/auth/errors.js';
+import { formatValidationErrors } from './shared/validation.js';
 
 const registerBodySchema = z.object({
   email: z.email(),
@@ -30,17 +31,6 @@ const refreshBodySchema = z.object({
 const logoutBodySchema = z.object({
   refreshToken: z.string().min(1),
 });
-
-function formatValidationErrors(error: z.ZodError) {
-  return {
-    status: 'error',
-    message: 'Validation failed',
-    errors: error.issues.map((issue) => ({
-      path: issue.path.join('.'),
-      message: issue.message,
-    })),
-  };
-}
 
 export function authRoutes(app: FastifyInstance): void {
   app.post('/auth/register', async (request, reply) => {

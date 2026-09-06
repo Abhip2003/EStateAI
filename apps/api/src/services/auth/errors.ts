@@ -19,6 +19,15 @@ export class UnauthorizedError extends Error {
   }
 }
 
+// Distinct from UnauthorizedError: the caller IS authenticated, but isn't
+// allowed to act on this particular resource (e.g. not the asset's owner).
+export class ForbiddenError extends Error {
+  constructor(message = 'Forbidden') {
+    super(message);
+    this.name = 'ForbiddenError';
+  }
+}
+
 export class InvalidRefreshTokenError extends Error {
   constructor(message = 'Invalid or expired refresh token') {
     super(message);
